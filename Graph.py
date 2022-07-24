@@ -1,8 +1,6 @@
-import sys
 import time
 import statistics
-from multiprocessing import Process
-from multiprocessing.queues import Queue
+from itertools import groupby
 
 from sklearn.neighbors import radius_neighbors_graph
 from scipy.sparse import csgraph
@@ -10,16 +8,11 @@ import pandas as pd
 from matplotlib import collections as mc
 from collections import Counter
 import logging
-from matplotlib.patches import Polygon
 from collections import defaultdict
-import multiprocessing
-from Cell import Cell
+from Cell import Cell, Marker
 from scipy.spatial import distance
 import pylab as plt
 import numpy as np
-import psutil
-
-from descartes import PolygonPatch
 import multiprocessing
 import Concave_Hull
 from scipy.spatial import Delaunay
@@ -57,46 +50,113 @@ def display_top(snapshot, key_type='lineno', limit=3):
     print("Total allocated size: %.1f KiB" % (total / 1024))
 
 
-def divide_chunks(l, n, sorted_list=False):
+def divide_chunks(my_list, number_of_chunks, sorted_list=False):
     # looping till length l
     if sorted_list:
         total = 0
         idx_from = 0
-        while total < len(l):
-            section = l[idx_from:len(l):n]
+        while total < len(my_list):
+            section = my_list[idx_from:len(my_list):number_of_chunks]
             total += len(section)
             idx_from += 1
             yield section
     else:
-        for i in range(0, len(l), n):
-            yield l[i:i + n]
+        for i in range(0, len(my_list), number_of_chunks):
+            yield my_list[i:i + number_of_chunks]
 
 
-def create_cells_parallel(initial_structure, idxs):
-    #tmp_id_to_cell_mapping = dict()
+def create_cells_parallel(initial_structure, indices):
     tmp_position_to_cell_mapping = dict()
     tmp_id_to_position_mapping = dict()
-    for i in idxs:
+    for i in indices:
         cell_1 = Cell(initial_structure.loc[i], i)
-        #tmp_id_to_cell_mapping[i] = cell_1
         tmp_id_to_position_mapping[i] = (cell_1.x, cell_1.y)
         tmp_position_to_cell_mapping[(cell_1.x, cell_1.y)] = cell_1
-    #return tmp_id_to_cell_mapping, tmp_position_to_cell_mapping, tmp_id_to_position_mapping
     return tmp_id_to_position_mapping, tmp_position_to_cell_mapping
+
+
+def _determine_margin_helper(number, boundary):
+    start = None
+    last = None
+    margin_positions = []
+    margin_edge_sequence = []
+    position_to_component = defaultdict(list)
+
+    for px, py in zip(*boundary.xy):
+        position = (px, py)
+        margin_positions.append(position)
+        if not start:
+            start = position
+        position_to_component[position] = number
+        if not last:
+            last = position
+            continue
+
+        margin_edge_sequence.append([last, position])
+        last = position
+
+    return margin_edge_sequence, margin_positions, position_to_component
+
+
+def determine_margin_parallel(points_for_concave_hull, number, alpha=20):
+
+    if len(points_for_concave_hull) <= 4:
+        return None, None
+
+    try:
+        concave_hull, edge_points = Concave_Hull.alpha_shape(points_for_concave_hull, alpha=alpha)
+    except:
+        print(points_for_concave_hull)
+        print("Empty edges for component: {}", number)
+
+    if not edge_points:
+        return [], [], defaultdict(list)
+    elif type(concave_hull.boundary).__name__ == "LineString":
+        return _determine_margin_helper(boundary=concave_hull.boundary, number=number)
+    else:
+        _inv_mar_seq_tmp = []
+        _inv_mar_tmp = []
+        _position_to_component = defaultdict(list)
+        for geom in concave_hull.geoms:
+            margin_edge_sequence, margin_positions, position_to_component = _determine_margin_helper(
+                boundary=geom.boundary,
+                number=number
+            )
+            _inv_mar_seq_tmp.extend(margin_edge_sequence)
+            _inv_mar_tmp.extend(margin_positions)
+            _position_to_component.update(position_to_component)
+        return _inv_mar_seq_tmp, _inv_mar_tmp, _position_to_component
+
+
+def _parallel_helper_margin_detection(islets, alpha):
+    tmp_invasive_margins_sequence = dict()
+    tmp_invasive_margins = dict()
+    position_to_component = defaultdict(list)
+
+    for idx, (islet_number, points_for_concave_hull) in enumerate(islets):
+        _seq, _cells, _position_to_component = determine_margin_parallel(points_for_concave_hull, islet_number,
+                                                                         alpha=alpha)
+        tmp_invasive_margins_sequence[islet_number] = _seq
+        tmp_invasive_margins[islet_number] = _cells
+        position_to_component.update(_position_to_component)
+
+    return tmp_invasive_margins_sequence, tmp_invasive_margins, position_to_component
 
 
 class Graph(object):
 
-    def __init__(self, initial_structure=None, max_dist=50, mode='connectivity'):
-        """ initializes a graph object
-            If no dictionary or None is given,
-            an empty dictionary will be used
-            mode in {‘connectivity’, ‘distance’} """
+    def __init__(self, initial_structure=None, max_dist=50, mode='connectivity', run_parallel=False):
+        """
+        Initializes a graph object.
+        If no dictionary or None is given, an empty dictionary will be used.
+        Possible mode in {‘connectivity’, ‘distance’}
+        :type max_dist: int
+        """
+        self._connected_components_positions = defaultdict(list)
         self._CK_neighbour_graph = None
         self._connected_components = None
         self._invasive_margins = defaultdict(list)
         self._invasive_margins_sequence = defaultdict(list)
-        #self._id_to_cell_mapping = dict()
         self._id_to_position_mapping = dict()
         self._position_to_cell_mapping = dict()
         self.max_dist = max_dist
@@ -123,7 +183,6 @@ class Graph(object):
             cx = self._graph_dict.tocoo()
 
             keys_total = 0
-            #self._id_to_cell_mapping = {}
             self._id_to_position_mapping = {}
             self._position_to_cell_mapping = {}
             start = time.process_time()
@@ -133,35 +192,28 @@ class Graph(object):
             ########
             ## BASIC MULTIPROCESSING APPROACH
             ########
+            if run_parallel:
+                n = 20000
+                idx_subsets = list(divide_chunks(list(unique_keys_id), n))
+                start = time.process_time()
+                with multiprocessing.Pool(processes=int(0.75 * multiprocessing.cpu_count()),
+                                          maxtasksperchild=1000) as pool:
 
-            # How many elements each
-            # list should have
-            n = 20000
+                    params = [(initial_structure, idx_subset) for idx_subset in idx_subsets]
+                    results = pool.starmap_async(create_cells_parallel, params)
 
-            idx_subsets = list(divide_chunks(list(unique_keys_id), n))
+                    for p in results.get():
+                        tmp_id_to_position_mapping, tmp_position_to_cell_mapping = p
+                        self._id_to_position_mapping.update(tmp_id_to_position_mapping)
+                        self._position_to_cell_mapping.update(tmp_position_to_cell_mapping)
 
-            start = time.process_time()
+            else:
+                for i in unique_keys_id:
+                    keys_total += 1
 
-            with multiprocessing.Pool(processes=int(0.75 * multiprocessing.cpu_count()),
-                                      maxtasksperchild=1000) as pool:
-
-                params = [(initial_structure, idx_subset) for idx_subset in idx_subsets]
-                #results = [pool.apply_async(self.create_cells_parallel, p) for p in params]
-                results = pool.starmap_async(create_cells_parallel, params)
-
-                for p in results.get():
-                    tmp_id_to_position_mapping, tmp_position_to_cell_mapping = p#.get()
-                    #self._id_to_cell_mapping.update(tmp_id_to_cell_mapping)
-                    self._id_to_position_mapping.update(tmp_id_to_position_mapping)
-                    self._position_to_cell_mapping.update(tmp_position_to_cell_mapping)
-
-
-            # for i in unique_keys_id:
-            #    keys_total += 1
-
-            #    cell_1 = Cell(initial_structure.loc[i])
-            #    self._id_to_cell_mapping[i] = cell_1
-            #    self._position_to_cell_mapping[(cell_1.x, cell_1.y)] = cell_1
+                    cell_1 = Cell(initial_structure.loc[i], i)
+                    self._id_to_position_mapping[i] = (cell_1.x, cell_1.y)
+                    self._position_to_cell_mapping[(cell_1.x, cell_1.y)] = cell_1
 
             print("Runtime, (Graph.__init__) {}, keys {}: ".format(time.process_time() - start,
                                                                    len(self._id_to_position_mapping)))
@@ -239,21 +291,20 @@ class Graph(object):
                         self._graph_dict[x] = []
                         self._graph_dict[x].append((x, y))
 
-    def connected_components(self, max_dist=50, mode='connectivity'):
+    def connected_components(self, mode='connectivity'):
         """value: n_components, labels"""
         if not self._connected_components:
-            # self.max_dist = max_dist
-
+            start_time = time.process_time()
+            print("Start computing connected_components().")
             ck_positive_x, ck_positive_y, idxs = list(
-                # zip(*[(cell.x, cell.y, idx) for idx, cell in enumerate(self._id_to_cell_mapping.values()) if
-                #      cell.activities['CK']])
                 zip(*[(val[0], val[1], key) for key, val in self._id_to_position_mapping.items() if
-                      self._position_to_cell_mapping[val].activities['CK']])
+                      self._position_to_cell_mapping[val].marker_is_active(Marker.CK)])  # activities['CK']])
             )
             ck_cells = list(zip(ck_positive_x, ck_positive_y))
 
             self._CK_neighbour_graph = radius_neighbors_graph(ck_cells,
-                                                              self.max_dist, mode=mode,
+                                                              self.max_dist,
+                                                              mode=mode,
                                                               include_self=False,
                                                               n_jobs=int(0.75 * multiprocessing.cpu_count()))
 
@@ -262,9 +313,22 @@ class Graph(object):
             tmp = np.array(list(self._id_to_position_mapping.keys()))
             tmp[:] = -1
             tmp[np.array(idxs)] = self._connected_components[1]
-
             self._connected_components = (self._connected_components[0], tmp)
 
+            print("Dictionary for connected_components().")
+            mid_time = time.process_time()
+
+            self._connected_components_positions = {k: [self._id_to_position_mapping[pos]
+                                                        for pos, val in g] for k, g in
+                                                    groupby(sorted(enumerate(self._connected_components[1]),
+                                                                   key=lambda x: x[1]),
+                                                            key=lambda x: x[1])
+                                                    }
+            print("Runtime, dictionary connected_components(): {}. ".format(
+                round(time.process_time() - mid_time, 3)))
+
+            print("Runtime, connected_components(): {}. ".format(
+                round(time.process_time() - start_time, 3)))
         return self._connected_components
 
     def characterize_CK_islets(self):
@@ -280,6 +344,9 @@ class Graph(object):
         cells_ids = np.where(self.connected_components()[1] == number)[0]
         return [position for id_, position in self._id_to_position_mapping.items() if id_ in cells_ids]
 
+    def get_CK_component_by_number(self, number):
+        return self._connected_components_positions[number]
+
     def determine_all_margins(self, alpha=20, min_islet_size=10, run_parallel=True):
 
         start_time = time.process_time()
@@ -287,11 +354,22 @@ class Graph(object):
 
         islet_sizes = self.characterize_CK_islets()
 
-        selected_islets = [(idx, islet_sizes.at[0, idx]) for idx in islet_sizes
-                           if islet_sizes.at[0, idx] >= min_islet_size and idx != -1]
-        selected_islets = [(idx, val) for idx, val in sorted(selected_islets, key=lambda x: x[1], reverse=True)]
-
         if run_parallel:
+
+            start_time = time.process_time()
+            self.connected_components()
+
+            print("Preparing data with components for parallelization.")
+
+            selected_islets = [(idx, islet_sizes.at[0, idx], self.get_CK_component_by_number(idx))
+                               for idx in islet_sizes
+                               if islet_sizes.at[0, idx] >= min_islet_size and idx != -1]
+            selected_islets = [(idx, component)
+                               for idx, size, component in sorted(selected_islets, key=lambda x: x[1], reverse=True)]
+
+            print("Runtime, data prepared: {}. ".format(
+                round(time.process_time() - start_time, 3)))
+
             number_of_cpu = int(0.75 * multiprocessing.cpu_count())
             number_of_islets = len(selected_islets)
             n = int(number_of_islets / number_of_cpu) + 1
@@ -306,40 +384,43 @@ class Graph(object):
                 number_of_islets, n, number_of_cpu
             ))
 
-            with multiprocessing.Pool(processes=8, maxtasksperchild=8) as pool:
+            with multiprocessing.Pool(processes=32, maxtasksperchild=32) as pool:
                 params = [(islets, alpha) for islets in islet_subsets]
 
                 ## APPLY ASYNC
-                #results = [pool.apply_async(self._parallel_helper_margin_detection, p) for p in params]
+                # results = [pool.apply_async(self._parallel_helper_margin_detection, p) for p in params]
                 ## print("Len of results: " + str(len(results)))
-                #for p in results:
+                # for p in results:
                 #    inv_mar_seq, inv_mar, position_to_component = p.get()
                 #    self._invasive_margins_sequence.update(inv_mar_seq)
                 #    self._invasive_margins.update(inv_mar)
                 #    self._position_to_component.update(position_to_component)
 
                 ## MAP ASYNC
-                results = pool.starmap_async(self._parallel_helper_margin_detection, params)
+                results = pool.starmap_async(_parallel_helper_margin_detection, params)
                 for p in results.get():
                     inv_mar_seq, inv_mar, position_to_component = p
                     self._invasive_margins_sequence.update(inv_mar_seq)
                     self._invasive_margins.update(inv_mar)
                     self._position_to_component.update(position_to_component)
 
-
         else:
+            selected_islets = [(idx, islet_sizes.at[0, idx])
+                               for idx in islet_sizes
+                               if islet_sizes.at[0, idx] >= min_islet_size and idx != -1]
+            selected_islets = [(idx, size)
+                               for idx, size in sorted(selected_islets, key=lambda x: x[1], reverse=True)]
+
             # WITHOUT MULTIPROCESSING
             for islet_number, islet_size in selected_islets:
                 print("Determine margin for islet number: " + str(islet_number) + " of size " + str(
                     islet_size))
-                # if islet_size >= min_islet_size and islet_number != -1:
+
                 inv_mar_seq, inv_mar, position_to_component = self.determine_margin(islet_number, alpha=alpha)
                 self._invasive_margins_sequence[islet_number] = inv_mar_seq
                 self._invasive_margins[islet_number] = inv_mar
                 self._position_to_component.update(position_to_component)
-                # else:
-                #    self._invasive_margins_sequence[islet_number] = []
-                #    self._invasive_margins[islet_number] = []
+
                 print("Runtime, determine_margin(): {}. ".format(
                     round(time.process_time() - mid_time, 3)))
                 mid_time = time.process_time()
@@ -348,58 +429,6 @@ class Graph(object):
                "Number of margins analyzed: {}").format(
             round(time.process_time() - start_time, 3),
             len(selected_islets)))
-
-    def _parallel_helper_margin_detection(self, islets, alpha):
-        tmp_invasive_margins_sequence = dict()
-        tmp_invasive_margins = dict()
-        position_to_component = defaultdict(list)
-        # seq_tot_len = 0
-        for idx, (islet_number, islet_size) in enumerate(islets):
-            _seq, _cells, _position_to_component = self.determine_margin(islet_number, alpha=alpha)
-            tmp_invasive_margins_sequence[islet_number] = _seq
-            # seq_tot_len += len(_seq)
-            tmp_invasive_margins[islet_number] = _cells
-            position_to_component.update(_position_to_component)
-            # print("[MEMORY USAGE] Margin size calculated {} ({} of {}).\n" +
-            #      "sys.getsizeof: mar_seq: {} (len: {}); {}, {}".format(
-            #    islet_size, idx, len(islets),
-            #    sys.getsizeof(tmp_invasive_margins_sequence), seq_tot_len,
-            #    sys.getsizeof(tmp_invasive_margins),
-            #    sys.getsizeof(position_to_component)
-            # ))
-            # print(psutil.virtual_memory())
-        return tmp_invasive_margins_sequence, tmp_invasive_margins, position_to_component
-
-    def _determine_margin_helper(self, number, boundary):
-        # type(boundary).__name__ == "LineString"
-
-        start = None
-        last = None
-        margin_positions = []
-        margin_edge_sequence = []
-        position_to_component = defaultdict(list)
-        #x, y = boundary.xy
-
-        for px, py in zip(*boundary.xy): #x, y):
-            position = (px, py)
-            margin_positions.append(position)
-            if not start:
-                start = position
-
-            # self._position_to_cell_mapping[position].on_margin = True
-            position_to_component[position] = number
-            # self._position_to_cell_mapping[position].margin_number = number
-            if not last:
-                last = position
-                continue
-
-            margin_edge_sequence.append([last, position])
-
-            # self._position_to_cell_mapping[last].margin_edge = position
-            last = position
-
-        #del x, y
-        return margin_edge_sequence, margin_positions, position_to_component
 
     def determine_margin(self, number, alpha=20):
         points_for_concave_hull = self.select_CK_component_points(number)
@@ -414,18 +443,16 @@ class Graph(object):
             print(points_for_concave_hull)
             print("Empty edges for component: {}", number)
 
-        # margin_points = set([ (x, y) for edge in edge_points for x, y in edge.tolist()])
-
         if not edge_points:
             return [], [], defaultdict(list)
         elif type(concave_hull.boundary).__name__ == "LineString":
-            return self._determine_margin_helper(boundary=concave_hull.boundary, number=number)
+            return _determine_margin_helper(boundary=concave_hull.boundary, number=number)
         else:
             _inv_mar_seq_tmp = []
             _inv_mar_tmp = []
             _position_to_component = defaultdict(list)
             for geom in concave_hull.geoms:
-                margin_edge_sequence, margin_positions, position_to_component = self._determine_margin_helper(
+                margin_edge_sequence, margin_positions, position_to_component = _determine_margin_helper(
                     boundary=geom.boundary,
                     number=number
                 )
@@ -433,8 +460,6 @@ class Graph(object):
                 _inv_mar_tmp.extend(margin_positions)
                 _position_to_component.update(position_to_component)
             return _inv_mar_seq_tmp, _inv_mar_tmp, _position_to_component
-
-    # def _parallel_get_invasive_margin_helper(self, indices):
 
     def get_invasive_margin(self, number):
         cells_positions = self._invasive_margins[number]
@@ -584,9 +609,6 @@ class Graph(object):
         xs = np.array([cell.x for cell in cells_to_plot])
         ys = np.array([cell.y for cell in cells_to_plot])
         phenotypes = np.array([cell.phenotype_label for cell in cells_to_plot])
-        on_margins = np.array([cell.on_margin for cell in cells_to_plot])
-
-        on_margins = np.array([cell.position in self._position_to_component for cell in cells_to_plot])
 
         print("Runtime, Graph.plot():compute arrays of data: {}.".format(
             round(time.process_time() - mid_time, 3)))
@@ -611,9 +633,7 @@ class Graph(object):
             for cmpNum in components_list:
                 _inv_mar_seq = self._invasive_margins_sequence[cmpNum]
                 lines["Margin-Border"].extend(_inv_mar_seq)
-                # _x, _y = _inv_mar_seq[0]
-                # labels[_inv_mar_seq[0]].append()
-                # for idx, line in enumerate(lines["Margin-Border"]):
+
                 if _inv_mar_seq:
                     (lab_x1, lab_y1), (lab_x2, lab_y2) = _inv_mar_seq[0]
                     ax.text((lab_x1 + lab_x2) / 2, (lab_y1 + lab_y2) / 2,
@@ -660,9 +680,10 @@ class Graph(object):
             for i, j, _ in zip(cx.row, cx.col, cx.data):
                 cell_j = self._position_to_cell_mapping[self._id_to_position_mapping[j]]
                 cell_i = self._position_to_cell_mapping[self._id_to_position_mapping[i]]
-                # if self._id_to_cell_mapping[i].margin_number == componentNumber and not cell_j.activities["CK"]:
+
                 if cell_i.position in self._position_to_component and \
-                        self._position_to_component[cell_i.position] == componentNumber and not cell_j.activities["CK"]:
+                        self._position_to_component[cell_i.position] == componentNumber and \
+                        not cell_j.marker_is_active(Marker.CK):  # activities["CK"]:
                     other_cells_x.append(cell_j.x)
                     other_cells_y.append(cell_j.y)
                     other_cells_phenotype.append(cell_j.phenotype_label)
@@ -769,8 +790,6 @@ class Graph(object):
                    for name, properties in lines_properties_dict.items()]
 
         first_legend = ax.legend(handles=proxies, loc='upper right')
-        # first_legend = ax.legend(handles = proxies, loc='upper center', bbox_to_anchor=(0.5, 1.1),
-        #                         fancybox=True, shadow=True, ncol=7, title="Gene Marker")
         ax.add_artist(first_legend)
 
         # Gathering points
@@ -781,14 +800,19 @@ class Graph(object):
         if pVert:
 
             for phenotype in set(phenotypes):
-                to_plot = np.where((phenotypes == phenotype) & (1 == on_margins))[0]
+                to_plot = np.where((phenotypes == phenotype))[0]
                 ax.scatter(xs[to_plot], ys[to_plot], alpha=isletAlpha,
                            color=color_dict_phenotypes[phenotype],
-                           label=phenotype, s=s, marker="o")
-                to_plot = np.where((phenotypes == phenotype) & (0 == on_margins))[0]
-                ax.scatter(xs[to_plot], ys[to_plot], alpha=isletAlpha,
-                           color=color_dict_phenotypes[phenotype],
-                           label=phenotype, s=s, marker="X")
+                           label=phenotype, s=s, marker=".")
+
+                # to_plot = np.where((phenotypes == phenotype) & (1 == on_margins))[0]
+                # ax.scatter(xs[to_plot], ys[to_plot], alpha=isletAlpha,
+                #           color=color_dict_phenotypes[phenotype],
+                #           label=phenotype, s=s, marker="o")
+                # to_plot = np.where((phenotypes == phenotype) & (0 == on_margins))[0]
+                # ax.scatter(xs[to_plot], ys[to_plot], alpha=isletAlpha,
+                #           color=color_dict_phenotypes[phenotype],
+                #           label=phenotype, s=s, marker="X")
             logging.debug(("Points collections: \n" +
                            "Islet: {};").format(len(cells_to_plot)))
 
@@ -801,18 +825,11 @@ class Graph(object):
             logging.debug(("Points collections: \n" +
                            "Outer (nonCK): {};").format(len(other_cells_x)))
 
-            # print("list len: " + str(len(margin_cells)))
-            # print("set len: " + str(len(set(margin_cells))))
-            # logging.debug(("Points collections.\n" +
-            #       "Islet: {}; Outer: {}; Margin Border: {};").format(
-            #    len(cells_to_plot), len(other_cells_x), len(margin_x)))
-
             proxies = [make_proxy(color, marker='o', label=name, markersize=s) for name, color in
                        color_dict_phenotypes.items()]
             second_legend = ax.legend(handles=proxies, loc='upper center', bbox_to_anchor=(0.5, 1.15),
                                       fancybox=True, shadow=True, ncol=7, title="Gene Marker")
 
-            # second_legend = ax.legend(handles = proxies, loc='upper left')
             ax.add_artist(second_legend)
 
         print("Runtime, Graph.plot():pVert: {}.".format(

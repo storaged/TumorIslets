@@ -1,5 +1,16 @@
 from scipy.spatial import distance
 
+from enum import Enum
+
+
+class Marker(Enum):
+    CK = 0
+    CD3 = 1
+    CD11c = 2
+    CD15 = 3
+    CD20 = 4
+    CD163 = 5
+
 
 class Cell(object):
     """Provides an object to wrap cell data
@@ -15,6 +26,7 @@ class Cell(object):
         margin_number    int - id number of margin to which the cell belongs
 
     """
+    __slots__ = ['id', 'x', 'y', 'phenotype_label', 'is_ck', 'tissue_type', 'activities_tuple']
 
     def __init__(self, record, idx):
         """
@@ -30,22 +42,28 @@ class Cell(object):
                 x -
                 y -
         """
+
         self.id = idx
         self.x = record['nucleus.x']
         self.y = record['nucleus.y']
-        self.activities = dict(
-            [(i.split(".")[0], float(record[i]) > 1) for i in record.keys() if "score.normalized" in i])
-        self.scores = dict([(i.split(".")[0], float(record[i])) for i in record.keys() if "score.normalized" in i])
-        self.tissue_type = record['tissue.type']
-        _phenotypes = [key for key, value in self.activities.items() if value]
 
+        _activities = dict(
+            [(i.split(".")[0], float(record[i]) > 1) for i in record.keys() if "score.normalized" in i])
+        self.activities_tuple = tuple([_activities[m.name] for m in Marker])
+        self.is_ck = _activities["CK"]
+
+        # self.scores = dict([(i.split(".")[0], float(record[i])) for i in record.keys() if "score.normalized" in i])
+
+        self.tissue_type = record['tissue.type']
+
+        _phenotypes = [key for key, value in _activities.items() if value]
         self.phenotype_label = '-'.join(sorted(_phenotypes, reverse=True))
         if self.phenotype_label == "":
             self.phenotype_label = "neg"
 
-        self.on_margin = False
-        self.margin_edge = None
-        self.margin_number = -1
+        #self.on_margin = False
+        #self.margin_edge = None
+        #self.margin_number = -1
 
     def __eq__(self, other):
         """Compares two cells"""
@@ -61,14 +79,17 @@ class Cell(object):
         """The radius property."""
         return self.x, self.y
 
-    def __delitem__(self, key):
-        self.activities.__delattr__(key)
+    def marker_is_active(self, marker):
+        return self.activities_tuple[marker.value]
 
-    def __getitem__(self, key):
-        return self.activities.__getattribute__(key)
+    # def __delitem__(self, key):
+    #    self.activities.__delattr__(key)
 
-    def __setitem__(self, key, value):
-        self.activities.__setattr__(key, value)
+    # def __getitem__(self, key):
+    #    return self.activities.__getattribute__(key)
+
+    # def __setitem__(self, key, value):
+    #    self.activities.__setattr__(key, value)
 
     def distance(self, other_cell):
         """Calculates euclidean distance between from the other_cell

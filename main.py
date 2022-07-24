@@ -49,6 +49,12 @@ def get_next_instruction():
 def main():
     import socket
 
+    from datetime import date
+    from pathlib import Path
+
+
+    today = date.today()
+
     tracemalloc.start()
     args = parse_my_arguments(sys.argv[1:])
     machine_name = socket.gethostname()
@@ -78,7 +84,8 @@ def main():
             only_files = only_files[:args.max_panels]
 
     for filename in only_files:
-        inv_marg_file = filename.replace("tsv-files", "invasive_margins").replace(".tsv.gz", "")
+        inv_marg_file = filename.replace("tsv-files", "invasive_margins_" + today.strftime("%y_%m_%d")).replace(".tsv.gz", "")
+        Path(my_dir.replace("tsv-files", "invasive_margins_" + today.strftime("%y_%m_%d"))).mkdir(exist_ok=True)
 
         cells_df = pd.read_csv(filename, sep="\t")
         max_cells = cells_df.shape[0] + 1 if args.max_cells is None else args.max_cells
@@ -87,7 +94,7 @@ def main():
             print("[INFO] Analysis of the file: {} with {} cells).".format(filename, cells_df.shape[0]))
 
             cells_df = cells_df if args.n_head is None else cells_df.head(args.n_head)
-            graph_new = Graph(cells_df, max_dist=args.neighbour_dist)
+            graph_new = Graph(cells_df, max_dist=args.neighbour_dist, run_parallel=args.parallel)
 
             graph_new.determine_all_margins(alpha=args.alpha, run_parallel=args.parallel)
 
