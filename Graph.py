@@ -34,7 +34,7 @@ def display_top(snapshot, key_type='lineno', limit=3):
     print("Top %s lines" % limit)
     for index, stat in enumerate(top_stats[:limit], 1):
         frame = stat.traceback[0]
-        # replace "/path/to/module/file.py" with "module/file.py"
+
         filename = os.sep.join(frame.filename.split(os.sep)[-2:])
         print("#%s: %s:%s: %.1f KiB"
               % (index, filename, frame.lineno, stat.size / 1024))
@@ -178,6 +178,7 @@ class Graph(object):
                                                       mode=mode,
                                                       include_self=True,
                                                       n_jobs=int(0.75 * multiprocessing.cpu_count()))
+
             print("Runtime, radius_neighbors_graph: " + str(time.process_time() - start))
 
             cx = self._graph_dict.tocoo()
@@ -477,7 +478,7 @@ class Graph(object):
         # return invasive_margin
         return list(set(invasive_margin))
 
-    def characterize_invasive_margins(self, numbers=None, path_to_save=None, save_plot=True, display_plots=False):
+    def characterize_invasive_margins(self, numbers=None, path_to_save=None, plot_labels=False, save_plot=True, display_plots=False):
 
         start_time = time.process_time()
         mid_time = start_time
@@ -535,13 +536,14 @@ class Graph(object):
                 height = rec.get_height()
                 _row = idx % tmp.shape[0]
                 _col = idx // tmp.shape[0]
-                ax_1.text(rec.get_x() + rec.get_width() / 2,
-                          rec.get_y() + height / 2,
-                          # "{:.0f}% ({:.0f})".format(height, tmp.iat[_row,_col]) if height != 0 else " ",
-                          "{:.0f}%".format(height) if height >= 5 else " ",
-                          ha='center',
-                          va='bottom',
-                          rotation=90)
+                if plot_labels:
+                    ax_1.text(rec.get_x() + rec.get_width() / 2,
+                              rec.get_y() + height / 2,
+                              # "{:.0f}% ({:.0f})".format(height, tmp.iat[_row,_col]) if height != 0 else " ",
+                              "{:.0f}%".format(height) if height >= 5 else " ",
+                              ha='center',
+                              va='bottom',
+                              rotation=90)
 
             labels = [item.get_text() + " (" + str(total_cells[idx]) + ")" for idx, item in
                       enumerate(ax_1.get_xticklabels())]
@@ -579,7 +581,7 @@ class Graph(object):
         return color_dict_phenotypes
 
     def plot(self, subset=None, componentNumber=None, pMarginBorder=True, pVert=True,
-             pIsletEdges=True, pMarginEdges=True, pOuterEdges=True, pOuterCells=True, addLabels=True,
+             pIsletEdges=True, pMarginEdges=True, pOuterEdges=True, pOuterCells=True, plot_labels=False,
              isletAlpha=0.075, marginIsletAlpha=0.5, marginAlpha=0.075, display_plots=False,
              s=5, figsize=(16, 12), path_to_save="tmp", verbose=False):
 
@@ -634,7 +636,7 @@ class Graph(object):
                 _inv_mar_seq = self._invasive_margins_sequence[cmpNum]
                 lines["Margin-Border"].extend(_inv_mar_seq)
 
-                if _inv_mar_seq:
+                if _inv_mar_seq and plot_labels:
                     (lab_x1, lab_y1), (lab_x2, lab_y2) = _inv_mar_seq[0]
                     ax.text((lab_x1 + lab_x2) / 2, (lab_y1 + lab_y2) / 2,
                             cmpNum, fontsize=9,

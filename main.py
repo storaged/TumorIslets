@@ -13,7 +13,7 @@ def parse_my_arguments(args):
     parser.add_argument('--n_head', dest='n_head', type=int, nargs='?',
                         help='number of records from IF Panel to visualize'),
     parser.add_argument('--max_cells', dest='max_cells', type=int, nargs='?',
-                        help='number of records on IF Panel to visualize')
+                        help='max number of records in IF data')
     parser.add_argument('--max_panels', dest='max_panels', type=int, nargs='?',
                         help='number of panels to visualize')
     parser.add_argument('--alpha', dest='alpha', type=int, nargs='?', default=30,
@@ -24,6 +24,9 @@ def parse_my_arguments(args):
     parser.add_argument('--parallel', dest='parallel', type=bool, nargs='?',
                         const=True, default=False,
                         help='Should we run it in multiprocessing mode?')
+    parser.add_argument('--labels', dest='labels', type=bool, nargs='?',
+                        const=True, default=False,
+                        help='Should we add layer with labels onto plots?')
     parser.add_argument('--neighbour_dist', dest='neighbour_dist', type=int, nargs='?', default=50,
                         help='number of panels to visualize')
     parser.add_argument('--testing', dest='testing', type=str, nargs='?',
@@ -99,7 +102,8 @@ def main():
             graph_new.determine_all_margins(alpha=args.alpha, run_parallel=args.parallel)
 
             graph_new.characterize_invasive_margins(path_to_save=inv_marg_file,
-                                                    display_plots=args.display_plots, save_plot=True)
+                                                    display_plots=args.display_plots,
+                                                    save_plot=True, plot_labels=args.labels)
             if args.testing == "local":
 
                 val_int = get_next_instruction()
@@ -110,14 +114,14 @@ def main():
                             #componentNumber=val,
                             s=10, verbose=False, pMarginBorder=True, path_to_save=inv_marg_file,
                             pIsletEdges=False, pMarginEdges=True, pOuterEdges=False,
-                            pOuterCells=True, pVert=True,
+                            pOuterCells=True, pVert=True, plot_labels=args.labels,
                             isletAlpha=0.1, marginIsletAlpha=0.2, marginAlpha=1, display_plots=args.display_plots)
                     else:
                         graph_new.plot(  # subset = graph_new.select_CK_component_IDs(17).tolist(),
                             componentNumber=val_int,
                             s=10, verbose=False, pMarginBorder=True, path_to_save=inv_marg_file,
                             pIsletEdges=False, pMarginEdges=True, pOuterEdges=False,
-                            pOuterCells=True, pVert=True,
+                            pOuterCells=True, pVert=True, plot_labels=args.labels,
                             isletAlpha=0.5, marginIsletAlpha=0.2, marginAlpha=1, display_plots=args.display_plots)
 
                     val_int = get_next_instruction()
@@ -127,7 +131,7 @@ def main():
                     #componentNumber=val,
                     s=10, verbose=False, pMarginBorder=True, path_to_save=inv_marg_file,
                     pIsletEdges=False, pMarginEdges=False, pOuterEdges=False,
-                    pOuterCells=True, pVert=True,
+                    pOuterCells=True, pVert=True, plot_labels=args.labels,
                     isletAlpha=0.1, marginIsletAlpha=0.2, marginAlpha=1, display_plots=args.display_plots)
                 graph_new._CK_neighbour_graph
 
@@ -141,5 +145,7 @@ def main():
     snapshot = tracemalloc.take_snapshot()
     display_top(snapshot)
 
+
 if __name__ == '__main__':
     main()
+
