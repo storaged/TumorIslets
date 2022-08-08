@@ -234,10 +234,6 @@ class Graph(object):
     def all_vertices_as_lists(self):
         return list(map(list, self._graph_dict.keys()))
 
-    def all_edges(self):
-        """ returns the edges of a graph """
-        return self.__generate_edges()
-
     def get_edges(self, vertex):
         if vertex in self._graph_dict:
             return self._graph_dict[vertex]
