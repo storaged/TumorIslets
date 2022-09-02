@@ -2,12 +2,14 @@ import time
 import statistics
 from itertools import groupby
 
+from shapely.geometry import MultiLineString
 from sklearn.neighbors import radius_neighbors_graph
 from scipy.sparse import csgraph
 import pandas as pd
 from matplotlib import collections as mc
 from collections import Counter
 import logging
+from matplotlib import cm
 from collections import defaultdict
 from Cell import Cell, Marker
 from scipy.spatial import distance
@@ -16,12 +18,25 @@ import numpy as np
 import multiprocessing
 import Concave_Hull
 from scipy.spatial import Delaunay
+import tqdm
+
+from tqdm.contrib.concurrent import process_map
 
 import linecache
 import os
 import tracemalloc
 
+import warnings
+
+warnings.filterwarnings("ignore")
+
 logging.basicConfig(level=logging.INFO)
+
+
+def no_position(): return -1
+
+
+def no_position_tuple(): return -1, -1
 
 
 def display_top(snapshot, key_type='lineno', limit=3):
@@ -75,6 +90,36 @@ def create_cells_parallel(initial_structure, indices):
     return tmp_id_to_position_mapping, tmp_position_to_cell_mapping
 
 
+def helper_margin_slices(points, alpha):
+    """
+    Helper function for components slicing.
+    """
+    points_for_concave_hull = points
+    if len(points_for_concave_hull) <= 4:
+        return None
+    try:
+        concave_hull, edge_points = Concave_Hull.alpha_shape(points_for_concave_hull, alpha=alpha)
+    except:
+        print("Empty edges for component: {}")
+        concave_hull, edge_points = [], []
+
+    if not edge_points:
+        return [], []
+    elif type(concave_hull.boundary).__name__ == "LineString":
+        return _determine_margin_helper(boundary=concave_hull.boundary, number=None)[0:2]
+    else:
+        _inv_mar_seq_tmp = []
+        _inv_mar_tmp = []
+        for geom in concave_hull.geoms:
+            margin_edge_sequence, margin_positions, position_to_component = _determine_margin_helper(
+                boundary=geom.boundary,
+                number=None
+            )
+            _inv_mar_seq_tmp.extend(margin_edge_sequence)
+            _inv_mar_tmp.extend(margin_positions)
+        return _inv_mar_seq_tmp, _inv_mar_tmp
+
+
 def _determine_margin_helper(number, boundary):
     start = None
     last = None
@@ -99,15 +144,14 @@ def _determine_margin_helper(number, boundary):
 
 
 def determine_margin_parallel(points_for_concave_hull, number, alpha=20):
-
     if len(points_for_concave_hull) <= 4:
         return None, None
 
     try:
         concave_hull, edge_points = Concave_Hull.alpha_shape(points_for_concave_hull, alpha=alpha)
     except:
-        print(points_for_concave_hull)
         print("Empty edges for component: {}", number)
+        concave_hull, edge_points = [], []
 
     if not edge_points:
         return [], [], defaultdict(list)
@@ -116,7 +160,7 @@ def determine_margin_parallel(points_for_concave_hull, number, alpha=20):
     else:
         _inv_mar_seq_tmp = []
         _inv_mar_tmp = []
-        _position_to_component = defaultdict(list)
+        _position_to_component = defaultdict(no_position)
         for geom in concave_hull.geoms:
             margin_edge_sequence, margin_positions, position_to_component = _determine_margin_helper(
                 boundary=geom.boundary,
@@ -132,7 +176,7 @@ def _parallel_helper_margin_detection(islets, alpha):
     tmp_invasive_margins_sequence = dict()
     tmp_invasive_margins = dict()
     position_to_component = defaultdict(list)
-
+    # print(">START || _parallel_helper_margin_detection: " + str(len(islets)))
     for idx, (islet_number, points_for_concave_hull) in enumerate(islets):
         _seq, _cells, _position_to_component = determine_margin_parallel(points_for_concave_hull, islet_number,
                                                                          alpha=alpha)
@@ -140,7 +184,110 @@ def _parallel_helper_margin_detection(islets, alpha):
         tmp_invasive_margins[islet_number] = _cells
         position_to_component.update(_position_to_component)
 
+    # print(">END || _parallel_helper_margin_detection: " + str(len(islets)))
     return tmp_invasive_margins_sequence, tmp_invasive_margins, position_to_component
+
+
+def components_slices_parallel(number, points, max_dist, alpha=20, steepness=6):
+    # print("COMPONENTS_SLICES_PARALLEL: START" + str(number))
+    """
+    DELETE POINT_TO_MARGIN!!!
+    The function to divide the selected component into a set of margin slices.
+    number:      number of the selected component
+    alpha:       parameter for alpha_shape function, when alpha gets smaller more precise concave
+                        hull is detected
+    steepness:   controls the steepness of selected regions
+    :return:     list of dataframes characterizing the steepest regions
+    """
+    # points = set(self.select_CK_component_points(number))
+    # determine first, exterior margin
+
+    # margin = set(helper_margin_slices(points, alpha=alpha)[1])
+    # sequence = helper_margin_slices(points, alpha=alpha)[0]
+
+    ## local variables to store information about iteratively computed margins
+    margin, sequence, margin_sequences = set([]), [], []
+
+    ## dictionary mapping margin number to a list of points composing it
+    margin_slices = defaultdict(list)
+
+    ## dictionary mapping position to a tuple (component_number, margin level)
+    position_to_margin_in_component = defaultdict(no_position_tuple)
+
+    # margin_slices = {1: margin}  # a dict to store points in different margins
+    # self._position_to_margin.update({point: (number, 1) if point in margin
+    # else (number, 0) for point in points})
+    # margin_sequences = [sequence]  # list of sequences of margins - for visualization
+    no_slices, zero_margin = 0, 0
+    # algorithm ends if less than 5 points are left and if we detect an empty margin
+
+    while len(points - margin) >= 5 and zero_margin != 1:
+        points = points - margin
+        sequence, margin = helper_margin_slices(points, alpha=alpha)
+        margin = set(margin)
+        # sequence = helper_margin_slices(points, alpha=alpha)[0]
+        # margin = set(helper_margin_slices(points, alpha=alpha)[1])
+        margin_sequences.append(sequence)  # sequence of edge points
+        no_slices += 1
+        margin_slices[no_slices] = margin
+
+        for point in margin:  # update dict
+            if sequence:
+                position_to_margin_in_component[point] = (number, no_slices)
+
+                # self._position_to_margin[point] = (number, no_slices)
+        if len(margin) == 0:  # for stop condition
+            zero_margin = 1
+
+    # Select steep regions
+    # points_margin = [key for key, value in self._position_to_margin.items()
+    #                 if value[0] == number and value[1] > 0]
+    points_margin = [key for key, value in position_to_margin_in_component.items()
+                     if value[0] == number and value[1] > 0]
+    component_graph = radius_neighbors_graph(list(points_margin), max_dist,
+                                             mode="connectivity", include_self=False,
+                                             n_jobs=1)  # int(0.75 * multiprocessing.cpu_count()))
+    nonzero_row, nonzero_col = component_graph.nonzero()
+    region_x, region_y = [], []
+
+    position_to_steepness = defaultdict(int)
+    for count, pos in enumerate(points_margin):
+        w = np.where(nonzero_row == count)
+        neighbors = list(nonzero_col[w])
+        max_steep = 0
+        for n in neighbors:
+            diff = abs(position_to_margin_in_component[points_margin[count]][1] -
+                       position_to_margin_in_component[points_margin[n]][1])
+            if diff > max_steep:
+                max_steep = diff
+        position_to_steepness[pos] = max_steep
+        if max_steep > steepness:
+            for n in neighbors:
+                region_x.append(points_margin[n][0])
+                region_y.append(points_margin[n][1])
+
+    # print("Possible steepness values", set(position_to_steepness.values()))
+    # 1. Plot from line collection
+    steep_points_x = [key[0] for key, value in position_to_margin_in_component.items()
+                      if value[1] > steepness]
+    steep_points_y = [key[1] for key, value in position_to_margin_in_component.items()
+                      if value[1] > steepness]
+    if not steep_points_x:
+        # print("Try using this function with smaller value of steepness parameter.")
+        return dict(), dict(), dict(), dict()
+    all_steep = [(x, y) for x, y in zip(steep_points_x + region_x, steep_points_y + region_y)]
+    graph_steep = radius_neighbors_graph(all_steep, max_dist,
+                                         mode="connectivity", include_self=False,
+                                         n_jobs=1)  # int(0.75 * multiprocessing.cpu_count()))
+    components_steep = csgraph.connected_components(graph_steep)
+
+    position_to_steep_region = defaultdict(no_position)
+    for i in range(components_steep[0]):
+        points = list(np.array(all_steep)[np.where(components_steep[1] == i)])
+        for point in points:
+            position_to_steep_region[tuple(point)] = i
+
+    return position_to_margin_in_component, margin_slices, position_to_steepness, position_to_steep_region
 
 
 class Graph(object):
@@ -159,8 +306,16 @@ class Graph(object):
         self._invasive_margins_sequence = defaultdict(list)
         self._id_to_position_mapping = dict()
         self._position_to_cell_mapping = dict()
+        self._position_to_id_mapping = dict()
         self.max_dist = max_dist
-        self._position_to_component = dict()
+        self._position_to_ck_component = defaultdict(no_position)
+        self._position_to_component = defaultdict(no_position)
+        self._position_to_margin = defaultdict(list)  # for margin slicing
+        self._position_to_steepness = defaultdict(list)
+        self._component_to_steepness_df = defaultdict(dict)
+        self._position_to_margin_in_component = defaultdict(no_position_tuple)
+        self._margin_slices = defaultdict(list)
+        self._position_to_steep_region = defaultdict(lambda: -1)
 
         if type(initial_structure).__name__ == "dict":
 
@@ -197,7 +352,7 @@ class Graph(object):
                 n = 20000
                 idx_subsets = list(divide_chunks(list(unique_keys_id), n))
                 start = time.process_time()
-                with multiprocessing.Pool(processes=int(0.75 * multiprocessing.cpu_count()),
+                with multiprocessing.Pool(processes=int(0.9 * multiprocessing.cpu_count()),
                                           maxtasksperchild=1000) as pool:
 
                     params = [(initial_structure, idx_subset) for idx_subset in idx_subsets]
@@ -216,77 +371,224 @@ class Graph(object):
                     self._id_to_position_mapping[i] = (cell_1.x, cell_1.y)
                     self._position_to_cell_mapping[(cell_1.x, cell_1.y)] = cell_1
 
+            self._position_to_id_mapping = {v: k for k, v in self._id_to_position_mapping.items()}
+
             print("Runtime, (Graph.__init__) {}, keys {}: ".format(time.process_time() - start,
                                                                    len(self._id_to_position_mapping)))
 
-    def edges(self, vertice):
-        """ returns a list of all the edges of a vertice"""
-        return self._graph_dict[vertice]
+    def compute_all_components_slices(self, alpha=20, steepness=6):
 
-    def all_vertices(self):
-        """ returns the vertices of a graph as a set """
-        return set(self._graph_dict.keys())
-
-    def all_vertices_coords_only(self):
-        """ returns the vertices of a graph as a set """
-        return [cell.position for cell in self._graph_dict.keys()]
-
-    def all_vertices_as_lists(self):
-        return list(map(list, self._graph_dict.keys()))
-
-    def get_edges(self, vertex):
-        if vertex in self._graph_dict:
-            return self._graph_dict[vertex]
+        number_of_cpu = int(0.75 * multiprocessing.cpu_count())
+        number_of_islets = len(set(self._position_to_component.values()))
+        n = int(number_of_islets / number_of_cpu) + 1
+        if n <= 2:
+            n = int(number_of_islets / 10) + 1
         else:
-            return set()
+            n = number_of_cpu
 
-    def parse_and_add_vertex(self, record, connect=True):
-        """ If the vertex "vertex" is not in
-            self._graph_dict, a key "vertex" with an empty
-            list as a value is added to the dictionary.
-            Otherwise nothing has to be done.   """
+        points_per_component = [(component_idx, set(self.select_CK_component_points(component_idx)))
+                                for component_idx in set(self._position_to_component.values())]
 
-        cell = Cell(record)
+        islet_subsets = list(divide_chunks(points_per_component, n, sorted_list=True))
 
-        if cell not in self._graph_dict:
-            self._graph_dict[cell] = []
-        if connect:
-            for cell_old in self._graph_dict.keys():
-                self.add_edge(cell, cell_old)
+        # with multiprocessing.Pool(processes=32, maxtasksperchild=32) as pool:
+        params1 = [component_no
+                   for component_no, points_in_islet in points_per_component]
+        params2 = [set(points_in_islet)
+                   for component_no, points_in_islet in points_per_component]
+        params3 = [self.max_dist
+                   for component_no, points_in_islet in points_per_component]
+        params4 = [alpha
+                   for component_no, points_in_islet in points_per_component]
+        params5 = [steepness
+                   for component_no, points_in_islet in points_per_component]
+        params = [(component_no, set(points_in_islet), self.max_dist, alpha, steepness)
+                  for component_no, points_in_islet in points_per_component]
 
-    def add_vertex(self, vertex, connect=True):
-        """ If the vertex "vertex" is not in
-            self._graph_dict, a key "vertex" with an empty
-            list as a value is added to the dictionary.
-            Otherwise nothing has to be done.   """
+        ## MAP ASYNC
+        results = process_map(components_slices_parallel, params1, params2, params3, params4, params5,
+                              max_workers=number_of_cpu)
+        for p in results:
+            position_to_margin_in_component, margin_slices, position_to_steepness, position_to_steep_region = p
 
-        if vertex not in self._graph_dict:
-            self._graph_dict[vertex] = []
-        if connect:
-            for vertex_old in self._graph_dict.keys():
-                self.add_edge(vertex, vertex_old)
+            non_ck_position_to_margin_in_component = dict()
+            non_ck_position_to_steep_region = dict()
 
-    def add_edge(self, vertex1, vertex2, directed=True):
-        """ assumes that edge is of type set, tuple or list;
-            between two vertices can be multiple edges!  """
+            for position, margin in position_to_margin_in_component.items():
+                cell_id = self._position_to_id_mapping[position]
+                for j in self._graph_dict[cell_id, :].indices:
+                    if not self._position_to_cell_mapping[self._id_to_position_mapping[j]].is_ck:
+                        non_ck_position_to_margin_in_component[self._id_to_position_mapping[j]] = margin
+                        non_ck_position_to_steep_region[self._id_to_position_mapping[j]] = position_to_steep_region[position]
 
-        if type(vertex1).__name__ == "Cell":
+            self._position_to_margin_in_component.update(position_to_margin_in_component)
+            self._position_to_margin_in_component.update(non_ck_position_to_margin_in_component)
+            self._margin_slices.update(margin_slices)
+            self._position_to_steepness.update(position_to_steepness)
+            self._position_to_steep_region.update(position_to_steep_region)
+            self._position_to_steep_region.update(non_ck_position_to_steep_region)
 
-            to_add = [(vertex1, vertex2)]
-            if not directed: to_add.append((vertex2, vertex1))
+    def components_slices(self, number, alpha=20, steepness=6):
+        """
+        DELETE POINT_TO_MARGIN!!!
+        The function to divide the selected component into a set of margin slices.
+        number:      number of the selected component
+        alpha:       parameter for alpha_shape function, when alpha gets smaller more precise concave
+                            hull is detected
+        steepness:   controls the steepness of selected regions
+        :return:     list of dataframes cha
+        racterizing the steepest regions
+        """
+        points = set(self.select_CK_component_points(number))
+        # determine first, exterior margin
+        margin = set(self.helper_margin_slices(points, alpha=alpha)[1])
+        sequence = self.helper_margin_slices(points, alpha=alpha)[0]
+        margin_slices = {1: margin}  # a dict to store points in different margins
+        self._position_to_margin.update({point: (number, 1) if point in margin
+        else (number, 0) for point in points})
+        margin_sequences = [sequence]  # list of sequences of margins - for visualization
+        no_slices, zero_margin = 1, 0
+        # algorithm ends if less than 5 points are left and if we detect an empty margin
+        while len(points - margin) >= 5 and zero_margin != 1:
+            points = points - margin
+            sequence = self.helper_margin_slices(points, alpha=alpha)[0]
+            margin = set(self.helper_margin_slices(points, alpha=alpha)[1])
+            margin_sequences.append(sequence)  # sequence of edge points
+            no_slices += 1
+            margin_slices[no_slices] = margin
+            for point in margin:  # update dict
+                if sequence:
+                    self._position_to_margin[point] = (number, no_slices)
+            if len(margin) == 0:  # for stop condition
+                zero_margin = 1
 
-            for x, y in to_add:
-                self._graph_dict[x].append(y)
-
-        # The ELSE part is to be removed once Cell class/type is tested properly
-        else:
-            if vertex1 != vertex2 and distance.euclidean(vertex1, vertex2) < self.max_dist:
-                for x, y in [(vertex1, vertex2), (vertex2, vertex1)]:
-                    if x in self._graph_dict:
-                        self._graph_dict[x].append((x, y))
-                    else:
-                        self._graph_dict[x] = []
-                        self._graph_dict[x].append((x, y))
+        # Select steep regions
+        points_margin = [key for key, value in self._position_to_margin.items()
+                         if value[0] == number and value[1] > 0]
+        component_graph = radius_neighbors_graph(list(points_margin), self.max_dist,
+                                                 mode="connectivity", include_self=False,
+                                                 n_jobs=int(0.75 * multiprocessing.cpu_count()))
+        nonzero_row, nonzero_col = component_graph.nonzero()
+        region_x, region_y = [], []
+        for count, pos in enumerate(points_margin):
+            w = np.where(nonzero_row == count)
+            neighbors = list(nonzero_col[w])
+            max_steep = 0
+            for n in neighbors:
+                diff = abs(self._position_to_margin[points_margin[count]][1] -
+                           self._position_to_margin[points_margin[n]][1])
+                if diff > max_steep:
+                    max_steep = diff
+            self._position_to_steepness[pos] = max_steep
+            if max_steep > steepness:
+                for n in neighbors:
+                    region_x.append(points_margin[n][0])
+                    region_y.append(points_margin[n][1])
+        print("Possible steepness values", set(self._position_to_steepness.values()))
+        # 1. Plot from line collection
+        steep_points_x = [key[0] for key, value in self._position_to_margin.items()
+                          if value[1] > steepness]
+        steep_points_y = [key[1] for key, value in self._position_to_margin.items()
+                          if value[1] > steepness]
+        if not steep_points_x:
+            print("Try using this function with smaller value of steepness parameter.")
+            return 0
+        all_steep = [(x, y) for x, y in zip(steep_points_x + region_x, steep_points_y + region_y)]
+        graph_steep = radius_neighbors_graph(all_steep, self.max_dist,
+                                             mode="connectivity", include_self=False,
+                                             n_jobs=int(0.75 * multiprocessing.cpu_count()))
+        components_steep = csgraph.connected_components(graph_steep)
+        steep_regions_dataframes = []
+        for i in range(components_steep[0]):
+            points = list(np.array(all_steep)[np.where(components_steep[1] == i)])
+            data = {"x-axis": [p[0] for p in points],
+                    "y-axis": [p[1] for p in points],
+                    "Margin_number": [self._position_to_margin[tuple(point)][1] for point in points],
+                    "Steep_region_number": [i] * len(points),
+                    "Cell_type": [self._position_to_cell_mapping[tuple(cell)].phenotype_label
+                                  for cell in points]}
+            # print(pd.DataFrame(data).head(5))
+            steep_regions_dataframes.append(pd.DataFrame(data))
+        self._component_to_steepness_df[number] = steep_regions_dataframes
+        # 2. Plot slicing and mark steep points
+        """
+        fig, ax = plt.subplots(figsize=(16, 9))
+        i = 1
+        color1 = iter(cm.rainbow(np.linspace(0, 1, len(margin_sequences)-1)))
+        for sequence in margin_sequences[:-1]:
+            x = [x[0][0] for x in sequence] + [x[1][0] for x in sequence]
+            y = [y[0][1] for y in sequence] + [y[1][1] for y in sequence]
+            c = next(color1)
+            collection_lines = mc.LineCollection(sequence, linestyle="-",
+                                                 label="Margin" + str(i), colors=c)
+            # ax.scatter(x=x, y=y, color=c, s=10)  # add points
+            ax.add_collection(collection_lines)
+            i += 1
+        ax.scatter(x=region_x, y=region_y, color="red", s=10)
+        ax.scatter(x=steep_points_x, y=steep_points_y, color="black", s=10)
+        x1 = list(ax.get_xlim())
+        y1 = list(ax.get_ylim())
+        plt.plot()
+        plt.grid(True)
+        plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+        plt.title("Margin slicing with steep points for component number: " + str(number))
+        plt.show()
+        # 3. Plot slicing and visualize components
+        fig, ax = plt.subplots(figsize=(16, 9))
+        color1 = iter(cm.gist_gray(np.linspace(0, 1, len(margin_sequences) - 1)))
+        for sequence in margin_sequences[:-1]:
+            c = next(color1)
+            collection_lines = mc.LineCollection(sequence, linestyle="-", colors=c, alpha=0.4)
+            ax.add_collection(collection_lines)
+        color2 = iter(cm.rainbow(np.linspace(0,1, components_steep[0]+1)))
+        for i in range(components_steep[0]):
+            ax.scatter(x = list(steep_regions_dataframes[i]["x-axis"]),
+                       y = list(steep_regions_dataframes[i]["y-axis"]),
+                       color=next(color2), s=20, label="Component" + str(i))
+        # ax.scatter(x=region_x, y=region_y, color="red", s=10)
+        # ax.scatter(x=steep_points_x, y=steep_points_y, color="black", s=10)
+        x1 = list(ax.get_xlim())
+        y1 = list(ax.get_ylim())
+        plt.plot()
+        plt.grid(True)
+        plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+        plt.title("Margin slicing with components detection for steep regions "
+                  "for component number: " + str(number))
+        plt.show()
+        # 3. Plot lines connecting steepest regions
+        fig, ax = plt.subplots(figsize=(16, 9))
+        color1 = iter(cm.rainbow(np.linspace(0, 1, len(margin_sequences) - 1)))
+        i = 1
+        for sequence in margin_sequences[:-1]:
+            sequence_modified = [s for s in sequence if self._position_to_margin[s[0]][1] > steepness
+                                and self._position_to_margin[s[1]][1] > steepness]
+            c = next(color1)
+            collection_lines = mc.LineCollection(sequence_modified, linestyle="-",
+                                                 label="Margin" + str(i), colors=c)
+            ax.add_collection(collection_lines)
+            i += 1
+        ax.set_xlim(x1)
+        ax.set_ylim(y1)
+        plt.plot()
+        plt.grid(True)
+        plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+        plt.title("Margin lines for steep, selected points for component number: " + str(number))
+        plt.show()
+        # 4. Only polygons without points
+        plt.rcParams["figure.figsize"] = [16, 9]
+        fig, ax = plt.subplots()
+        color = iter(cm.rainbow(np.linspace(0, 1, len(margin_sequences) - 1)))
+        for sequence in margin_sequences[:-1]:
+            c = next(color)
+            multi = MultiLineString(sequence)
+            polygons = list(polygonize(unary_union(multi)))
+            for polygon in polygons:
+                patch = PolygonPatch(polygon, facecolor=c, edgecolor=c, alpha=0.3)
+                ax.add_patch(patch)
+        ax.autoscale()
+        plt.show()
+        return steep_regions_dataframes
+        """
 
     def connected_components(self, mode='connectivity'):
         """value: n_components, labels"""
@@ -306,6 +608,11 @@ class Graph(object):
                                                               n_jobs=int(0.75 * multiprocessing.cpu_count()))
 
             self._connected_components = csgraph.connected_components(self._CK_neighbour_graph)
+
+            for position, component_no, cell_id in zip(ck_cells, self._connected_components[1], idxs):
+                self._position_to_ck_component[position] = component_no
+                for j in self._graph_dict[cell_id, :].indices:
+                    self._position_to_ck_component[self._id_to_position_mapping[j]] = component_no
 
             tmp = np.array(list(self._id_to_position_mapping.keys()))
             tmp[:] = -1
@@ -339,7 +646,7 @@ class Graph(object):
 
     def select_CK_component_points(self, number):
         cells_ids = np.where(self.connected_components()[1] == number)[0]
-        return [position for id_, position in self._id_to_position_mapping.items() if id_ in cells_ids]
+        return [self._id_to_position_mapping[id_] for id_ in cells_ids]
 
     def get_CK_component_by_number(self, number):
         return self._connected_components_positions[number]
@@ -381,7 +688,8 @@ class Graph(object):
                 number_of_islets, n, number_of_cpu
             ))
 
-            with multiprocessing.Pool(processes=32, maxtasksperchild=32) as pool:
+            with multiprocessing.Pool(processes=int(0.9 * multiprocessing.cpu_count()),
+                                      maxtasksperchild=1000) as pool:
                 params = [(islets, alpha) for islets in islet_subsets]
 
                 ## APPLY ASYNC
@@ -437,8 +745,8 @@ class Graph(object):
         try:
             concave_hull, edge_points = Concave_Hull.alpha_shape(points_for_concave_hull, alpha=alpha)
         except:
-            print(points_for_concave_hull)
             print("Empty edges for component: {}", number)
+            concave_hull, edge_points = [], []
 
         if not edge_points:
             return [], [], defaultdict(list)
@@ -447,7 +755,7 @@ class Graph(object):
         else:
             _inv_mar_seq_tmp = []
             _inv_mar_tmp = []
-            _position_to_component = defaultdict(list)
+            _position_to_component = defaultdict(no_position)
             for geom in concave_hull.geoms:
                 margin_edge_sequence, margin_positions, position_to_component = _determine_margin_helper(
                     boundary=geom.boundary,
@@ -474,7 +782,8 @@ class Graph(object):
         # return invasive_margin
         return list(set(invasive_margin))
 
-    def characterize_invasive_margins(self, numbers=None, path_to_save=None, plot_labels=False, save_plot=True, display_plots=False):
+    def characterize_invasive_margins(self, numbers=None, path_to_save=None, plot_labels=False, save_plot=True,
+                                      display_plots=False):
 
         start_time = time.process_time()
         mid_time = start_time
@@ -578,8 +887,8 @@ class Graph(object):
 
     def plot(self, subset=None, componentNumber=None, pMarginBorder=True, pVert=True,
              pIsletEdges=True, pMarginEdges=True, pOuterEdges=True, pOuterCells=True, plot_labels=False,
-             isletAlpha=0.075, marginIsletAlpha=0.5, marginAlpha=0.075, display_plots=False,
-             s=5, figsize=(16, 12), path_to_save="tmp", verbose=False):
+             isletAlpha=0.075, marginIsletAlpha=0.5, marginAlpha=0.075, pSlices=True, display_plots=False,
+             s=5, figsize=(14, 10), path_to_save="tmp", verbose=False):
 
         print("Graph.plot(): START")
         start_time = time.process_time()
@@ -607,6 +916,8 @@ class Graph(object):
         xs = np.array([cell.x for cell in cells_to_plot])
         ys = np.array([cell.y for cell in cells_to_plot])
         phenotypes = np.array([cell.phenotype_label for cell in cells_to_plot])
+
+        slices = np.array([self._position_to_steep_region[cell.position] for cell in cells_to_plot])
 
         print("Runtime, Graph.plot():compute arrays of data: {}.".format(
             round(time.process_time() - mid_time, 3)))
@@ -797,8 +1108,19 @@ class Graph(object):
 
         if pVert:
 
+            if pSlices:
+                for _slice in set(slices):
+                    to_plot = np.where((slices == _slice) & (slices != -1))[0]
+                    if any(to_plot):
+                        ax.scatter(xs[to_plot], ys[to_plot], alpha=0.8,
+                                   color="black", s=s, marker="o")
+
+            #    logging.debug(("Slices points collections: \n" +
+            #                   "Islet: {};").format(len(cells_to_plot)))
+
             for phenotype in set(phenotypes):
                 to_plot = np.where((phenotypes == phenotype))[0]
+
                 ax.scatter(xs[to_plot], ys[to_plot], alpha=isletAlpha,
                            color=color_dict_phenotypes[phenotype],
                            label=phenotype, s=s, marker=".")

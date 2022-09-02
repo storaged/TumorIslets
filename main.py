@@ -5,8 +5,16 @@
 import os
 import sys
 import argparse
+
+import pandas as pd
+
 from Graph import *
-#os.system("taskset -p 0xff %d" % os.getpid())
+# os.system("taskset -p 0xff %d" % os.getpid())
+
+import linecache
+import os
+import tracemalloc
+
 
 def parse_my_arguments(args):
     parser = argparse.ArgumentParser(description='Process Islet Graph Analysis arguments.')
@@ -21,6 +29,9 @@ def parse_my_arguments(args):
     parser.add_argument('--display_plots', dest='display_plots', type=bool, nargs='?',
                         const=True, default=False,
                         help='Should we display plots on fly?')
+    parser.add_argument('--skip_plots', dest='skip_plots', type=bool, nargs='?',
+                        const=True, default=False,
+                        help='Should we compute plots?')
     parser.add_argument('--parallel', dest='parallel', type=bool, nargs='?',
                         const=True, default=False,
                         help='Should we run it in multiprocessing mode?')
@@ -34,6 +45,7 @@ def parse_my_arguments(args):
                         help='number of panels to visualize')
 
     return parser.parse_args(args)
+
 
 def get_next_instruction():
     int_val = None
@@ -54,7 +66,6 @@ def main():
 
     from datetime import date
     from pathlib import Path
-
 
     today = date.today()
 
@@ -87,7 +98,8 @@ def main():
             only_files = only_files[:args.max_panels]
 
     for filename in only_files:
-        inv_marg_file = filename.replace("tsv-files", "invasive_margins_" + today.strftime("%y_%m_%d")).replace(".tsv.gz", "")
+        inv_marg_file = filename.replace("tsv-files", "invasive_margins_" + today.strftime("%y_%m_%d")).replace(
+            ".tsv.gz", "")
         Path(my_dir.replace("tsv-files", "invasive_margins_" + today.strftime("%y_%m_%d"))).mkdir(exist_ok=True)
 
         cells_df = pd.read_csv(filename, sep="\t")
@@ -98,42 +110,77 @@ def main():
 
             cells_df = cells_df if args.n_head is None else cells_df.head(args.n_head)
             graph_new = Graph(cells_df, max_dist=args.neighbour_dist, run_parallel=args.parallel)
-
             graph_new.determine_all_margins(alpha=args.alpha, run_parallel=args.parallel)
 
-            graph_new.characterize_invasive_margins(path_to_save=inv_marg_file,
-                                                    display_plots=args.display_plots,
-                                                    save_plot=True, plot_labels=args.labels)
-            if args.testing == "local":
+            graph = Graph(cells_df)
+            graph.connected_components()
 
+            print("How many:", graph._connected_components[0])
+            # graph.slicing_all_graph("component_slices/slicing10up_0193.csv")
+
+            # graph_new.compute_all_components_slices(steepness=5)
+            print("START: graph_new.compute_all_components_slices()")
+            graph_new.compute_all_components_slices(alpha=args.alpha, steepness=5)
+            print("END: graph_new.compute_all_components_slices()")
+
+            # graph_new.characterize_invasive_margins(path_to_save=inv_marg_file,
+            #                                        display_plots=args.display_plots,
+            #                                        save_plot=True, plot_labels=args.labels)
+
+            steep_regions_dataframes = []
+
+            for id, position in graph_new._id_to_position_mapping.items():
+                data = {"x-axis": position[0],
+                            "y-axis": position[1],
+                            "component_number": graph_new._position_to_ck_component[position],
+                            "component_margin_number": graph_new._position_to_component[position],
+                            "margin_in_component_number": graph_new._position_to_margin_in_component[position][1],
+                            "steep_region_number": graph_new._position_to_steep_region[position],
+                            "cell_type": graph_new._position_to_cell_mapping[position].phenotype_label}
+
+                steep_regions_dataframes.append(data)
+
+            df_to_save = pd.DataFrame(steep_regions_dataframes)
+            panel_desc_file = filename.replace("tsv-files", "panels_description").replace(".tsv.gz", ".csv")
+            df_to_save.to_csv(panel_desc_file)
+
+            if args.skip_plots:
+                continue
+
+            if args.testing == "local":
+                print(Counter(graph_new._position_to_component.values()).keys())
+                print(Counter(graph_new._position_to_component.values()).values())
                 val_int = get_next_instruction()
 
                 while val_int != -1:
                     if val_int == 999:
                         graph_new.plot(  # subset = graph_new.select_CK_component_IDs(17).tolist(),
-                            #componentNumber=val,
+                            # componentNumber=val,
                             s=10, verbose=False, pMarginBorder=True, path_to_save=inv_marg_file,
                             pIsletEdges=False, pMarginEdges=True, pOuterEdges=False,
                             pOuterCells=True, pVert=True, plot_labels=args.labels,
-                            isletAlpha=0.1, marginIsletAlpha=0.2, marginAlpha=1, display_plots=args.display_plots)
+                            isletAlpha=0.2, marginIsletAlpha=0.2, marginAlpha=1, pSlices=True,
+                            display_plots=args.display_plots)
                     else:
                         graph_new.plot(  # subset = graph_new.select_CK_component_IDs(17).tolist(),
                             componentNumber=val_int,
                             s=10, verbose=False, pMarginBorder=True, path_to_save=inv_marg_file,
                             pIsletEdges=False, pMarginEdges=True, pOuterEdges=False,
-                            pOuterCells=True, pVert=True, plot_labels=args.labels,
-                            isletAlpha=0.5, marginIsletAlpha=0.2, marginAlpha=1, display_plots=args.display_plots)
+                            pOuterCells=True, pVert=True, plot_labels=args.labels, pSlices=True,
+                            isletAlpha=0.2, marginIsletAlpha=0.2, marginAlpha=1, display_plots=args.display_plots)
 
                     val_int = get_next_instruction()
 
             else:
                 graph_new.plot(  # subset = graph_new.select_CK_component_IDs(17).tolist(),
-                    #componentNumber=val,
+                    # componentNumber=val,
                     s=10, verbose=False, pMarginBorder=True, path_to_save=inv_marg_file,
                     pIsletEdges=False, pMarginEdges=False, pOuterEdges=False,
                     pOuterCells=True, pVert=True, plot_labels=args.labels,
                     isletAlpha=0.1, marginIsletAlpha=0.2, marginAlpha=1, display_plots=args.display_plots)
-                graph_new._CK_neighbour_graph
+                # graph_new._CK_neighbour_graph
+
+
 
 
 
@@ -148,4 +195,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
